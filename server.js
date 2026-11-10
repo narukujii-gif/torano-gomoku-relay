@@ -87,10 +87,13 @@ function leaveRoom(ws) {
   const room = ws._room;
   if (!room) return;
   ws._room = null;
-  if (!room.over) {
-    room.over = true;
-    room.players.forEach((p) => { if (p && p.ws !== ws) send(p.ws, { type: "opponent_left" }); });
-  }
+  // The peer is told in EVERY phase: mid-match AND after the
+  // game is decided, while the result screen waits (a rematch
+  // may already have been offered). The old `!room.over` guard
+  // kept post-game leaves silent, so the waiting player never
+  // learned the opponent had gone (user report 2026-11-10).
+  room.over = true;
+  room.players.forEach((p) => { if (p && p.ws !== ws) send(p.ws, { type: "opponent_left" }); });
   cleanupRoom(room);
 }
 
