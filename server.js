@@ -10,6 +10,11 @@ const PORT = process.env.PORT || 8377;
 const SIZE = 15;
 const DIRS = [[1, 0], [0, 1], [1, 1], [1, -1]];
 const ROOM_TTL_MS = 10 * 60 * 1000; // 相手が来ない部屋の寿命
+// 対局成立後の無操作タイムアウト (user spec 2026-11-12): 片方が
+// 10分間うごかないと、両方に idle_timeout を知らせて部屋を閉じる。
+// テスト用に環境変数で短縮できる (本番は既定の10分)。
+const IDLE_TIMEOUT_MS = Number(process.env.IDLE_TIMEOUT_MS) || 10 * 60 * 1000;
+const IDLE_SWEEP_MS = Math.max(250, Math.min(30000, Math.floor(IDLE_TIMEOUT_MS / 2)));
 
 const rooms = new Map(); // code -> room
 
@@ -61,6 +66,7 @@ function makeRoom(code, hostWs) {
     over: false,
     rematchWants: new Set(),
     ttl: null,
+    lastActivity: Date.now(),
   };
   room.ttl = setTimeout(() => {
     if (room.players.length < 2) {
@@ -79,6 +85,7 @@ function startGame(room) {
   room.turn = 1;
   room.over = false;
   room.rematchWants.clear();
+  room.lastActivity = Date.now();
   if (room.ttl) { clearTimeout(room.ttl); room.ttl = null; }
   room.players.forEach((p) => send(p.ws, { type: "start", you: p.color, turn: 1 }));
 }
@@ -147,6 +154,7 @@ wss.on("connection", (ws) => {
       if (room.board[r][c] !== 0) return;
       room.board[r][c] = me.color;
       room.moves++;
+      room.lastActivity = Date.now();
       const win = checkWin(room.board, r, c, me.color);
       const draw = !win && room.moves >= SIZE * SIZE;
       broadcast(room, { type: "move", r, c, p: me.color });
@@ -163,6 +171,7 @@ wss.on("connection", (ws) => {
     }
     if (msg.type === "rematch") {
       if (!room.over) return;
+      room.lastActivity = Date.now();
       room.rematchWants.add(me.color);
       if (room.rematchWants.size >= 2) {
         // 再戦では先手・後手を入れ替える（公平のため）
@@ -178,6 +187,22 @@ wss.on("connection", (ws) => {
   ws.on("close", () => leaveRoom(ws));
   ws.on("error", () => leaveRoom(ws));
 });
+
+// 無操作の部屋を見回る: 対局が成立した部屋 (2人そろった部屋) で
+// 最後の着手/再戦申し込みから IDLE_TIMEOUT_MS 経つと、両方へ
+// idle_timeout を送って部屋を閉じる。相手が来ない部屋は従来の
+// TTL (room_expired) が担当するので、ここでは扱わない。
+setInterval(() => {
+  const now = Date.now();
+  rooms.forEach((room) => {
+    if (room.players.length < 2) return;
+    if (now - room.lastActivity > IDLE_TIMEOUT_MS) {
+      broadcast(room, { type: "idle_timeout" });
+      room.players.forEach((p) => { if (p) p.ws._room = null; });
+      cleanupRoom(room);
+    }
+  });
+}, IDLE_SWEEP_MS);
 
 httpServer.listen(PORT, () => {
   console.log("gomoku relay listening on :" + PORT);
