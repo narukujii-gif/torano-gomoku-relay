@@ -56,9 +56,12 @@ function genCode() {
   return String(Math.floor(100000 + Math.random() * 900000)); // 混雑時は6桁
 }
 
-function makeRoom(code, hostWs) {
+function makeRoom(code, hostWs, isPrivate) {
   const room = {
     code,
+    // プライベートな部屋 (user spec 2026-11-17): あいことばを
+    // 知っている人だけが入れる。クイックマッチの対象にはならない。
+    priv: !!isPrivate,
     players: [{ ws: hostWs, color: 1 }], // 先手=1(黒), 後手=2(白)
     board: newBoard(),
     moves: 0,
@@ -125,8 +128,40 @@ wss.on("connection", (ws) => {
     if (msg.type === "create") {
       if (ws._room) leaveRoom(ws);
       const code = genCode();
-      makeRoom(code, ws);
-      send(ws, { type: "created", code });
+      const room = makeRoom(code, ws, msg.private === true);
+      send(ws, { type: "created", code, private: room.priv });
+      return;
+    }
+    if (msg.type === "list") {
+      // 「へやを さがす」用 (user spec 2026-11-17): 待機中の公開部屋の
+      // あいことば一覧を返す。プライベートな部屋は載せない。
+      // 入る操作自体は既存の join (あいことば指定) で行う。
+      if (ws._room) return;
+      const codes = [];
+      rooms.forEach((room) => {
+        if (codes.length < 6 && room.players.length < 2 && !room.priv) codes.push(room.code);
+      });
+      send(ws, { type: "rooms", rooms: codes });
+      return;
+    }
+    if (msg.type === "quick") {
+      // クイックマッチ (user spec 2026-11-17): 待機中の公開部屋が
+      // あれば客として入り、なければ自分がホストで公開部屋を作る。
+      // プライベートな部屋と自分の部屋は対象にしない。
+      let target = null;
+      rooms.forEach((room) => {
+        if (!target && room !== ws._room && room.players.length < 2 && !room.priv) target = room;
+      });
+      if (ws._room) leaveRoom(ws);
+      if (target) {
+        target.players.push({ ws, color: 2 });
+        ws._room = target;
+        startGame(target);
+      } else {
+        const code = genCode();
+        makeRoom(code, ws, false);
+        send(ws, { type: "created", code, private: false });
+      }
       return;
     }
     if (msg.type === "join") {
