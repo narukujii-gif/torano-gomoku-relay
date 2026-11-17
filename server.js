@@ -15,6 +15,14 @@ const ROOM_TTL_MS = 10 * 60 * 1000; // 相手が来ない部屋の寿命
 // テスト用に環境変数で短縮できる (本番は既定の10分)。
 const IDLE_TIMEOUT_MS = Number(process.env.IDLE_TIMEOUT_MS) || 10 * 60 * 1000;
 const IDLE_SWEEP_MS = Math.max(250, Math.min(30000, Math.floor(IDLE_TIMEOUT_MS / 2)));
+// 再接続の猶予 (user request 2026-11-17): 対局成立後に片方の回線が
+// 切れても、部屋はすぐ消さず GRACE_MS の間その席を空けて待つ。
+// その間に本人 (あいことば+席トークン) が戻れば対局を再開できる。
+// テスト用に環境変数で短縮できる (本番は既定の30秒)。
+const GRACE_MS = Number(process.env.REJOIN_GRACE_MS) || 30000;
+function newToken() {
+  return Math.random().toString(16).slice(2, 8) + Math.random().toString(16).slice(2, 8);
+}
 
 const rooms = new Map(); // code -> room
 
@@ -46,6 +54,7 @@ function broadcast(room, obj) {
 }
 function cleanupRoom(room) {
   if (room.ttl) clearTimeout(room.ttl);
+  if (room.graceTimer) clearTimeout(room.graceTimer);
   rooms.delete(room.code);
 }
 function genCode() {
@@ -62,9 +71,13 @@ function makeRoom(code, hostWs, isPrivate) {
     // プライベートな部屋 (user spec 2026-11-17): あいことばを
     // 知っている人だけが入れる。クイックマッチの対象にはならない。
     priv: !!isPrivate,
-    players: [{ ws: hostWs, color: 1 }], // 先手=1(黒), 後手=2(白)
+    players: [{ ws: hostWs, color: 1, token: newToken(), away: false }], // 先手=1(黒), 後手=2(白)
     board: newBoard(),
     moves: 0,
+    history: [], // 再接続時の局面復元用に全着手を保持する
+    winner: null, // 決着済みのとき 0(引分)/1/2、未決着は null
+    gameSeq: 0, // startGame のたびに増える。再接続側が「新しい対局が始まっていた」ことを検知する
+    graceTimer: null,
     turn: 1,
     over: false,
     rematchWants: new Set(),
@@ -85,12 +98,43 @@ function makeRoom(code, hostWs, isPrivate) {
 function startGame(room) {
   room.board = newBoard();
   room.moves = 0;
+  room.history = [];
+  room.winner = null;
+  room.gameSeq++;
   room.turn = 1;
   room.over = false;
   room.rematchWants.clear();
   room.lastActivity = Date.now();
   if (room.ttl) { clearTimeout(room.ttl); room.ttl = null; }
-  room.players.forEach((p) => send(p.ws, { type: "start", you: p.color, turn: 1 }));
+  room.players.forEach((p) => send(p.ws, { type: "start", you: p.color, turn: 1, token: p.token, seq: room.gameSeq, code: room.code }));
+}
+
+// 回線が切れたときの処理 (user request 2026-11-17): 対局が成立
+// している部屋では即座に部屋を消さず、席を空席 (away) にして
+// GRACE_MS 待つ。相手には peer_away を知らせる。猶予内に本人が
+// 戻らなければ、従来どおり opponent_left を送って部屋を閉じる。
+// まだ相手が来ていない部屋は従来どおり即座に片付ける。
+function armGrace(room) {
+  if (room.graceTimer) clearTimeout(room.graceTimer);
+  room.graceTimer = setTimeout(() => {
+    room.graceTimer = null;
+    if (!room.players.some((p) => p && p.away)) return;
+    room.over = true;
+    room.players.forEach((p) => { if (p && p.ws) { send(p.ws, { type: "opponent_left" }); p.ws._room = null; } });
+    cleanupRoom(room);
+  }, GRACE_MS);
+}
+function dropSeat(ws) {
+  const room = ws._room;
+  if (!room) return;
+  if (room.gameSeq < 1) { leaveRoom(ws); return; }
+  const seat = room.players.find((p) => p && p.ws === ws);
+  ws._room = null;
+  if (!seat) return;
+  seat.ws = null;
+  seat.away = true;
+  room.players.forEach((p) => { if (p && p.ws) send(p.ws, { type: "peer_away" }); });
+  armGrace(room);
 }
 
 function leaveRoom(ws) {
@@ -154,7 +198,7 @@ wss.on("connection", (ws) => {
       });
       if (ws._room) leaveRoom(ws);
       if (target) {
-        target.players.push({ ws, color: 2 });
+        target.players.push({ ws, color: 2, token: newToken(), away: false });
         ws._room = target;
         startGame(target);
       } else {
@@ -171,9 +215,32 @@ wss.on("connection", (ws) => {
       if (!room) { send(ws, { type: "error", reason: "no_room" }); return; }
       if (room.players.length >= 2) { send(ws, { type: "error", reason: "full" }); return; }
       if (ws._room) leaveRoom(ws);
-      room.players.push({ ws, color: 2 });
+      room.players.push({ ws, color: 2, token: newToken(), away: false });
       ws._room = room;
       startGame(room);
+      return;
+    }
+    if (msg.type === "rejoin") {
+      // 切断からの復帰 (user request 2026-11-17): あいことばと
+      // 席トークンが一致し、その席が空席 (away) のときだけ
+      // 受け付ける。局面は全着手の履歴で返す。
+      const room = rooms.get(String(msg.code || ""));
+      const seat = room && room.players.find((p) => p && p.away && p.token === String(msg.token || ""));
+      if (!room || !seat) { send(ws, { type: "error", reason: "no_room" }); return; }
+      if (ws._room) leaveRoom(ws);
+      seat.ws = ws;
+      seat.away = false;
+      ws._room = room;
+      if (!room.players.some((p) => p && p.away) && room.graceTimer) {
+        clearTimeout(room.graceTimer);
+        room.graceTimer = null;
+      }
+      send(ws, {
+        type: "rejoined", you: seat.color, turn: room.turn, seq: room.gameSeq,
+        moves: room.history, over: room.over, winner: room.winner,
+        rematch: Array.from(room.rematchWants),
+      });
+      room.players.forEach((p) => { if (p && p.ws && p.ws !== ws) send(p.ws, { type: "peer_back" }); });
       return;
     }
     const room = ws._room;
@@ -189,15 +256,18 @@ wss.on("connection", (ws) => {
       if (room.board[r][c] !== 0) return;
       room.board[r][c] = me.color;
       room.moves++;
+      room.history.push({ r, c, p: me.color });
       room.lastActivity = Date.now();
       const win = checkWin(room.board, r, c, me.color);
       const draw = !win && room.moves >= SIZE * SIZE;
       broadcast(room, { type: "move", r, c, p: me.color });
       if (win) {
         room.over = true;
+        room.winner = me.color;
         broadcast(room, { type: "game_over", winner: me.color, reason: "five" });
       } else if (draw) {
         room.over = true;
+        room.winner = 0;
         broadcast(room, { type: "game_over", winner: 0, reason: "draw" });
       } else {
         room.turn = me.color === 1 ? 2 : 1;
@@ -219,8 +289,8 @@ wss.on("connection", (ws) => {
     }
     if (msg.type === "leave") { leaveRoom(ws); return; }
   });
-  ws.on("close", () => leaveRoom(ws));
-  ws.on("error", () => leaveRoom(ws));
+  ws.on("close", () => dropSeat(ws));
+  ws.on("error", () => dropSeat(ws));
 });
 
 // 無操作の部屋を見回る: 対局が成立した部屋 (2人そろった部屋) で
@@ -231,6 +301,7 @@ setInterval(() => {
   const now = Date.now();
   rooms.forEach((room) => {
     if (room.players.length < 2) return;
+    if (room.players.some((p) => p && p.away)) return; // 再接続の猶予中は armGrace が担当
     if (now - room.lastActivity > IDLE_TIMEOUT_MS) {
       broadcast(room, { type: "idle_timeout" });
       room.players.forEach((p) => { if (p) p.ws._room = null; });
