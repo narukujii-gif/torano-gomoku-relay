@@ -65,12 +65,22 @@ function genCode() {
   return String(Math.floor(100000 + Math.random() * 900000)); // 混雑時は6桁
 }
 
-function makeRoom(code, hostWs, isPrivate) {
+// へやの なまえ (user request 2026-11-18): 定型文のみ。知らない人の
+// 画面に出るものなので、自由文は受け付けない (子ども向け安全)。
+// クライアント側にも同じ一覧がある。
+const ROOM_NAMES = ["たのしい へや", "げんきな へや", "のんびり へや", "ゆうきの へや", "わくわく へや", "にこにこ へや", "まったり へや", "どきどき へや", "ほのぼの へや", "つよい へや"];
+function pickRoomName(name) {
+  if (typeof name === "string" && ROOM_NAMES.indexOf(name) >= 0) return name;
+  return ROOM_NAMES[Math.floor(Math.random() * ROOM_NAMES.length)];
+}
+
+function makeRoom(code, hostWs, isPrivate, name) {
   const room = {
     code,
     // プライベートな部屋 (user spec 2026-11-17): あいことばを
     // 知っている人だけが入れる。クイックマッチの対象にはならない。
     priv: !!isPrivate,
+    name: pickRoomName(name),
     players: [{ ws: hostWs, color: 1, token: newToken(), away: false }], // 先手=1(黒), 後手=2(白)
     board: newBoard(),
     moves: 0,
@@ -106,7 +116,7 @@ function startGame(room) {
   room.rematchWants.clear();
   room.lastActivity = Date.now();
   if (room.ttl) { clearTimeout(room.ttl); room.ttl = null; }
-  room.players.forEach((p) => send(p.ws, { type: "start", you: p.color, turn: 1, token: p.token, seq: room.gameSeq, code: room.code }));
+  room.players.forEach((p) => send(p.ws, { type: "start", you: p.color, turn: 1, token: p.token, seq: room.gameSeq, code: room.code, name: room.name }));
 }
 
 // 回線が切れたときの処理 (user request 2026-11-17): 対局が成立
@@ -172,8 +182,8 @@ wss.on("connection", (ws) => {
     if (msg.type === "create") {
       if (ws._room) leaveRoom(ws);
       const code = genCode();
-      const room = makeRoom(code, ws, msg.private === true);
-      send(ws, { type: "created", code, private: room.priv });
+      const room = makeRoom(code, ws, msg.private === true, msg.name);
+      send(ws, { type: "created", code, private: room.priv, name: room.name });
       return;
     }
     if (msg.type === "list") {
@@ -182,10 +192,11 @@ wss.on("connection", (ws) => {
       // 入る操作自体は既存の join (あいことば指定) で行う。
       if (ws._room) return;
       const codes = [];
+      const names = {};
       rooms.forEach((room) => {
-        if (codes.length < 6 && room.players.length < 2 && !room.priv) codes.push(room.code);
+        if (codes.length < 6 && room.players.length < 2 && !room.priv) { codes.push(room.code); names[room.code] = room.name; }
       });
-      send(ws, { type: "rooms", rooms: codes });
+      send(ws, { type: "rooms", rooms: codes, names });
       return;
     }
     if (msg.type === "quick") {
@@ -203,8 +214,8 @@ wss.on("connection", (ws) => {
         startGame(target);
       } else {
         const code = genCode();
-        makeRoom(code, ws, false);
-        send(ws, { type: "created", code, private: false });
+        const room = makeRoom(code, ws, false);
+        send(ws, { type: "created", code, private: false, name: room.name });
       }
       return;
     }
